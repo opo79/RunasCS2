@@ -34,6 +34,30 @@ Uses `LogonUser` → `DuplicateTokenEx` (impersonation token) → `CreateProcess
 
 > **Requires**: `SeImpersonatePrivilege` on the calling process. Without it, the call fails with error 1314 (`ERROR_PRIVILEGE_NOT_HELD`).
 
+### Fix 5 – Command taken from the raw command line
+
+**Previous behaviour**: the command was read from `args[2]`, which the .NET runtime has already split with CRT rules. Windows PowerShell 5.1 does not escape embedded quotes, so
+
+```powershell
+.\RunasCS2.exe user pass "cmd.exe /c echo `"AAA BBB`""
+```
+
+arrives as `"cmd.exe /c echo "AAA BBB""`, and `args[2]` becomes `cmd.exe /c echo AAA` (output: `AAA`).
+
+**RunasCS2**: the command is sliced out of `GetCommandLineW()` (everything after the password, up to the trailing `--domain` / `--logon-type` / `--bypass-uac` options):
+
+| Form received | Command used |
+|---|---|
+| `"cmd /c echo "A B""` (PowerShell 5.1) | outer quotes stripped, inner kept: `cmd /c echo "A B"` |
+| `"cmd /c echo \"A B\""` (cmd.exe / PowerShell 7.3+) | standard CRT unescape: `cmd /c echo "A B"` |
+| `cmd /c echo "A B"` (unquoted, multiple tokens) | used verbatim |
+
+> **Caveats**
+>
+> - The PowerShell 5.1 form is detected heuristically: the command is treated as PS 5.1-style when it starts and ends with `"` and the second unescaped `"` is immediately followed by a non-whitespace character. Unusual quoting may be misclassified.
+> - Options (`--domain`, `--logon-type`, `--bypass-uac`) are recognised only as a trailing sequence after the command. Strings like `--domain` inside the command itself are left untouched.
+> - If quoting does not come out as expected, prefer an unambiguous form: run from `cmd.exe` with `\"` escapes, use PowerShell 7.3+, or pass the line verbatim with PowerShell's stop-parsing token (`--%`).
+
 ## Build
 
 **Linux (Mono)**:

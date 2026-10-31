@@ -18,6 +18,11 @@
 //         CreateProcessWithTokenW. Requires SeImpersonatePrivilege on the
 //         calling process.
 //
+//   Fix5: The command is cut out of the raw command line (GetCommandLineW)
+//         instead of args[2]. Windows PowerShell 5.1 passes
+//         "cmd /c echo `"A B`"" as "cmd /c echo "A B"" (inner quotes not
+//         escaped), so the CRT-split args[2] became "cmd /c echo A".
+//
 // Build (Linux / Mono):
 //   mcs -out:RunasCS2.exe RunasCS2.cs
 // Build (Windows .NET Framework):
@@ -28,6 +33,7 @@
 //                [--domain <domain>] [--logon-type <2|3|8|9>] [--bypass-uac]
 
 using System;
+using System.Collections.Generic;
 using System.Runtime.InteropServices;
 using System.Text;
 
@@ -103,6 +109,10 @@ class RunasCS2
     [DllImport("kernel32.dll", SetLastError = true)]
     static extern bool CloseHandle(IntPtr hObject);
 
+    // 生のコマンドラインを取得 (args[] は CRT 分割済みなので Fix5 で使わない)
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode)]
+    static extern IntPtr GetCommandLineW();
+
     // ── Structs ─────────────────────────────────────────────────────────────
 
     [StructLayout(LayoutKind.Sequential)]
@@ -174,18 +184,33 @@ class RunasCS2
 
         string username   = args[0];
         string password   = args[1];
-        string command    = args[2];   // verbatim — Fix1
         string domain     = ".";
         int    logonType  = 0;         // 0 = use CreateProcessWithLogonW (デフォルト)
         bool   bypassUac  = false;
 
-        for (int i = 3; i < args.Length; i++)
+        // Fix5: コマンドは args[] ではなく生のコマンドラインから切り出す。
+        // Windows PowerShell 5.1 は "cmd /c echo `"A B`"" を
+        // "cmd /c echo "A B"" として渡すため、CRT 分割後の args[2] は
+        // "cmd /c echo A" になり、引用符内のスペースで切れてしまう。
+        string rawLine = Marshal.PtrToStringUni(GetCommandLineW());
+        var tokens = Tokenize(rawLine);
+        int optStart = FindOptionStart(tokens);
+        if (tokens.Count < 4 || optStart < 4)
         {
-            if (args[i] == "--domain" && i + 1 < args.Length)
-                domain = args[++i];
-            else if (args[i] == "--logon-type" && i + 1 < args.Length)
-                logonType = int.Parse(args[++i]);
-            else if (args[i] == "--bypass-uac")
+            Console.Error.WriteLine("[-] Failed to parse command line");
+            return 1;
+        }
+
+        string command = ExtractCommand(rawLine, tokens, 3, optStart);
+
+        for (int i = optStart; i < tokens.Count; i++)
+        {
+            string a = tokens[i].Value;
+            if (a == "--domain")
+                domain = tokens[++i].Value;
+            else if (a == "--logon-type")
+                logonType = int.Parse(tokens[++i].Value);
+            else if (a == "--bypass-uac")
                 bypassUac = true;
         }
 
@@ -362,6 +387,138 @@ class RunasCS2
 
         if (!ok) Die("CreateProcessWithTokenW (SeImpersonatePrivilege が必要)");
         return ok;
+    }
+
+    // ── Fix5: 生コマンドラインの解析 ─────────────────────────────────────────
+
+    class Token
+    {
+        public int Start, End;   // rawLine 上の位置 [Start, End)
+        public string Value;     // CRT 規則でデコードした値
+    }
+
+    // CommandLineToArgvW / MSVCRT 互換の分割。位置情報も保持する。
+    static List<Token> Tokenize(string s)
+    {
+        var list = new List<Token>();
+        int i = 0, n = s.Length;
+
+        // argv[0] は引用符のみ解釈し、バックスラッシュはそのまま
+        while (i < n && char.IsWhiteSpace(s[i])) i++;
+        if (i < n)
+        {
+            var t0 = new Token { Start = i };
+            var v0 = new StringBuilder();
+            bool q0 = false;
+            for (; i < n && (q0 || !char.IsWhiteSpace(s[i])); i++)
+            {
+                if (s[i] == '"') q0 = !q0;
+                else v0.Append(s[i]);
+            }
+            t0.End = i;
+            t0.Value = v0.ToString();
+            list.Add(t0);
+        }
+
+        while (true)
+        {
+            while (i < n && char.IsWhiteSpace(s[i])) i++;
+            if (i >= n) break;
+
+            var t = new Token { Start = i };
+            var v = new StringBuilder();
+            bool inQuote = false;
+
+            while (i < n && (inQuote || !char.IsWhiteSpace(s[i])))
+            {
+                if (s[i] == '\\')
+                {
+                    int bs = 0;
+                    while (i < n && s[i] == '\\') { bs++; i++; }
+                    if (i < n && s[i] == '"')
+                    {
+                        v.Append('\\', bs / 2);
+                        if (bs % 2 == 1) { v.Append('"'); i++; }
+                    }
+                    else
+                        v.Append('\\', bs);
+                }
+                else if (s[i] == '"')
+                {
+                    if (inQuote && i + 1 < n && s[i + 1] == '"')
+                    {
+                        v.Append('"');   // 引用符内の "" は " 1 文字
+                        i += 2;
+                    }
+                    else
+                    {
+                        inQuote = !inQuote;
+                        i++;
+                    }
+                }
+                else
+                    v.Append(s[i++]);
+            }
+
+            t.End = i;
+            t.Value = v.ToString();
+            list.Add(t);
+        }
+
+        return list;
+    }
+
+    // tokens[k..] がすべてオプションとして解釈できる最小の k (k >= 4) を返す。
+    // コマンド中に "--domain" 等が含まれていても、末尾の連続部分のみをオプションとみなす。
+    static int FindOptionStart(List<Token> tokens)
+    {
+        for (int k = 4; k <= tokens.Count; k++)
+            if (IsOptionTail(tokens, k)) return k;
+        return tokens.Count;
+    }
+
+    static bool IsOptionTail(List<Token> tokens, int k)
+    {
+        int dummy;
+        for (int i = k; i < tokens.Count; i++)
+        {
+            string a = tokens[i].Value;
+            if (a == "--bypass-uac")
+                continue;
+            if (a == "--domain" && i + 1 < tokens.Count)
+                i++;
+            else if (a == "--logon-type" && i + 1 < tokens.Count
+                     && int.TryParse(tokens[i + 1].Value, out dummy))
+                i++;
+            else
+                return false;
+        }
+        return true;
+    }
+
+    static string ExtractCommand(string rawLine, List<Token> tokens, int first, int end)
+    {
+        string raw = rawLine.Substring(tokens[first].Start,
+                                       tokens[end - 1].End - tokens[first].Start);
+
+        // PowerShell 5.1 形式: "cmd /c echo "A B"" → 外側の引用符だけ外して中身をそのまま使う。
+        // 判定: 先頭と末尾が " で、2 番目の (非エスケープ) " の直後が空白でない。
+        if (raw.Length >= 2 && raw[0] == '"' && raw[raw.Length - 1] == '"')
+        {
+            int q = -1;
+            for (int i = 1; i < raw.Length - 1; i++)
+                if (raw[i] == '"' && raw[i - 1] != '\\') { q = i; break; }
+
+            if (q > 0 && !char.IsWhiteSpace(raw[q + 1]))
+                return raw.Substring(1, raw.Length - 2);
+        }
+
+        // 1 トークン: cmd.exe の \"...\" や PowerShell 7.3+ の正規エスケープ → CRT デコード値
+        if (end - first == 1)
+            return tokens[first].Value;
+
+        // 複数トークン (外側の引用符なしで書かれたコマンド) → 生文字列をそのまま
+        return raw;
     }
 
     // ────────────────────────────────────────────────────────────────────────
